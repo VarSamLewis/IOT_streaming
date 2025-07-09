@@ -8,12 +8,114 @@ import asyncio
 import aiohttp
 from dateutil import parser
 from pyspark import SparkContext
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit, avg, sum as spark_sum  # import only what you need
+from pyspark.sql.types import *
+
 import paho.mqtt.client as mqtt
 import csv
 import os
 import threading
 import json_utils
 import types
+# Add these imports at the top
+import dash
+from dash import dcc, html, Input, Output
+import plotly.graph_objects as go
+from collections import deque
+
+# Global data storage (add this after your existing globals)
+data_store = {
+    'timestamps': deque(maxlen=50),  # Keep last 50 points
+    'temperatures': deque(maxlen=50),
+    'humidity': deque(maxlen=50),
+    'device_ids': deque(maxlen=50)
+}
+
+# Dashboard functions (add these anywhere in your file)
+def create_dash_app():
+    app = dash.Dash(__name__)
+    
+    app.layout = html.Div([
+        html.H1("IoT Dashboard", style={'text-align': 'center'}),
+        dcc.Graph(id='temperature-chart'),
+        dcc.Graph(id='humidity-chart'),
+        dcc.Interval(
+            id='interval-component',
+            interval=1000,  # Update every 1 second
+            n_intervals=0
+        )
+    ])
+    
+    @app.callback(
+        Output('temperature-chart', 'figure'),
+        Input('interval-component', 'n_intervals')
+    )
+    def update_temperature_chart(n):
+        if len(data_store['timestamps']) == 0:
+            return {'data': [], 'layout': {'title': 'Temperature Over Time'}}
+        
+        fig = go.Figure()
+        timestamps = list(data_store['timestamps'])
+        temperatures = list(data_store['temperatures'])
+        
+        fig.add_trace(go.Scatter(
+            x=timestamps,
+            y=temperatures,
+            mode='lines+markers',
+            name='Temperature',
+            line=dict(color='red')
+        ))
+        
+        fig.update_layout(
+            title='Temperature Over Time',
+            xaxis_title='Time',
+            yaxis_title='Temperature (C)',
+            xaxis=dict(type='date')
+        )
+        return fig
+    
+    @app.callback(
+        Output('humidity-chart', 'figure'),
+        Input('interval-component', 'n_intervals')
+    )
+    def update_humidity_chart(n):
+        if len(data_store['timestamps']) == 0:
+            return {'data': [], 'layout': {'title': 'Humidity Over Time'}}
+        
+        fig = go.Figure()
+        timestamps = list(data_store['timestamps'])
+        humidity = list(data_store['humidity'])
+        
+        fig.add_trace(go.Scatter(
+            x=timestamps,
+            y=humidity,
+            mode='lines+markers',
+            name='Humidity',
+            line=dict(color='blue')
+        ))
+        
+        fig.update_layout(
+            title='Humidity Over Time',
+            xaxis_title='Time',
+            yaxis_title='Humidity (%)',
+            xaxis=dict(type='date')
+        )
+        return fig
+    
+    return app
+
+def start_dashboard():
+    app = create_dash_app()
+    app.run(debug=False, port=8050)
+
+def add_data_to_store(data):
+    """Add new data point to the global store"""
+    data_store['timestamps'].append(data['timestamp'])
+    data_store['temperatures'].append(data['temperature'])
+    data_store['humidity'].append(data['humidity'])
+    data_store['device_ids'].append(data['device_id'])
+
 
 # Ammednd this to a database eventually
 csv_file_path = "IOT_data.csv"
@@ -229,6 +331,47 @@ async def mqtt_producer_loop():
             client.loop_stop()
             client.disconnect()
 
+#################################################################################################################################
+# Spark consumer class
+class SparkMQTTConsumer:
+    def __init__(self):
+        self.spark = SparkSession.builder.appName("IoTSpark").getOrCreate()
+        self.client = mqtt.Client()
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+    
+    def on_connect(self, client, userdata, flags, rc):
+        print(f"Spark connected: {rc}")
+        client.subscribe(CLEAN_TOPIC)
+    
+    def on_message(self, client, userdata, msg):
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+            df = self.spark.createDataFrame([data])
+        
+            # Your Spark processing here
+            print("Spark data:")
+            df.show()
+        
+            # Send to dashboard
+            add_data_to_store(data)
+        
+        except Exception as e:
+            print(f"Spark error: {e}")
+
+    def send_to_dashboard(self, data):
+        """Send processed data to dashboard"""
+        # Import the dashboard function
+        from dashboard import add_data_to_store
+        add_data_to_store(data)
+    
+    def start(self):
+        self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        self.client.loop_forever()
+
+def start_spark_consumer():
+    consumer = SparkMQTTConsumer()
+    consumer.start()
 
 
 if __name__ == "__main__":
@@ -239,6 +382,15 @@ if __name__ == "__main__":
     # Start MQTT consumer (subscriber) in a thread
     consumer_thread = threading.Thread(target=mqtt_consumer_loop, daemon=True)
     consumer_thread.start()
+
+    # Start Spark consumer in a thread
+    spark_thread = threading.Thread(target=start_spark_consumer, daemon=True)
+    spark_thread.start()
+
+    # Start Dashboard in a thread
+    dashboard_thread = threading.Thread(target=start_dashboard, daemon=True)
+    dashboard_thread.start()
+
 
     # Start MQTT producer (publisher) loop
     asyncio.run(mqtt_producer_loop())
